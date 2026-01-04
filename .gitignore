@@ -1,0 +1,82 @@
+# ================================
+# OPA / Policy-as-Code
+# ================================
+
+# OPA binaries
+opa
+opa.exe
+
+# OPA eval / test output
+*.result
+*.results
+*.out
+
+# Bundles / build artifacts
+bundle.tar.gz
+bundle/
+dist/
+build/
+
+# Temporary rendered manifests
+policies.yaml
+rendered.yaml
+*.rendered.yaml
+kustomize.yaml
+/tmp/
+tmp/
+
+# CI working directories
+.ci/
+ci/tmp/
+ci/.cache/
+
+# Test coverage / profiling
+coverage.out
+*.prof
+
+# ================================
+# OS / Editor noise
+# ================================
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ================================
+# Logs
+# ================================
+
+*.log
+
+# ================================
+# Env / Secrets (never commit)
+# ================================
+
+.env
+.env.*
+*.env
+
+# ================================
+# Local tooling
+# ================================
+
+node_modules/
+vendor/
+
+# ================================
+# Terraform (if used in CI helpers)
+# ================================
+
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate*
+crash.log
