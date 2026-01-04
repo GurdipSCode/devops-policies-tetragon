@@ -1,4 +1,4 @@
-# 🛡️ Tetragon OPA Governance
+# 🛡️ devops-policies-tetragon
 
 ![OPA](https://img.shields.io/badge/OPA-Policy--as--Code-blue?logo=openpolicyagent&logoColor=white)
 ![Kubernetes](https://img.shields.io/badge/Kubernetes-Policy%20Governance-326CE5?logo=kubernetes&logoColor=white)
