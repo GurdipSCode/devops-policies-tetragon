@@ -1,0 +1,214 @@
+# =========================
+# Buildkite Pipeline: Cilium Tetragon OPA Policies
+# =========================
+
+env:
+  VAULT_ADDR: "https://vault.example.com"  # centralized Vault URL
+
+steps:
+  # =========================
+  # 0️⃣ Vault JWT Secrets Fetch
+  # =========================
+  - label: "🔑 Vault | Fetch Secrets via JWT"
+    key: vault-secrets
+    commands:
+      - |
+        set -e
+        echo "Logging into Vault using JWT..."
+        VAULT_JWT=$(cat /var/run/secrets/buildkite/jwt)
+        vault login -method=jwt role=buildkite jwt="$VAULT_JWT"
+
+        echo "Fetching secrets..."
+        export GITGUARDIAN_API_KEY=$(vault kv get -field=key secret/buildkite/gitguardian)
+        export HARBOR_USERNAME=$(vault kv get -field=username secret/buildkite/harbor)
+        export HARBOR_PASSWORD=$(vault kv get -field=password secret/buildkite/harbor)
+        export COSIGN_PRIVATE_KEY=$(vault kv get -field=private_key secret/buildkite/cosign)
+        export COSIGN_PUBLIC_KEY=$(vault kv get -field=public_key secret/buildkite/cosign)
+        echo "✅ Secrets loaded from Vault"
+
+  # =========================
+  # 1️⃣ Install tooling
+  # =========================
+  - label: "🧰 Tooling | Install OPA, ggshield, Semgrep, git-cliff, oras, cosign, regal, vault"
+    key: install-tools
+    commands:
+      - |
+        set -e
+        # Install OPA, GitGuardian, Semgrep, git-cliff, oras, cosign, Regal, Vault CLI
+        # [Installation commands same as before]
+
+  # =========================
+  # 1.5️⃣ OPA Regal lint
+  # =========================
+  - label: "🧹 OPA | Lint Rego (Regal)"
+    depends_on: install-tools
+    commands:
+      - |
+        set -e
+        OUTPUT=$(mktemp)
+        if ! regal lint rego | tee "$OUTPUT"; then
+          buildkite-agent annotate --style "error" --context "OPA Regal Lint" --append < "$OUTPUT"
+          exit 1
+        fi
+
+  # =========================
+  # 2️⃣ PR / Feature Branch Preview (Fail-on-error)
+  # =========================
+  - label: "🔍 Preview | Security & OPA checks (PRs)"
+    branches: "!main"
+    depends_on: install-tools
+    soft_fail: false   # <-- ensures failure blocks PR merge
+    commands:
+      - |
+        set -e
+        echo "Vault JWT login + fetch secrets..."
+        VAULT_JWT=$(cat /var/run/secrets/buildkite/jwt)
+        vault login -method=jwt role=buildkite jwt="$VAULT_JWT"
+        export GITGUARDIAN_API_KEY=$(vault kv get -field=key secret/buildkite/gitguardian)
+        export COSIGN_PUBLIC_KEY=$(vault kv get -field=public_key secret/buildkite/cosign)
+
+        # ---- GitGuardian scan ----
+        OUTPUT=$(mktemp)
+        ggshield secret scan repo . --all --exit-zero=false | tee "$OUTPUT"
+        if [ ${PIPESTATUS[0]} -ne 0 ]; then
+          buildkite-agent annotate --style "error" --context "GitGuardian" --append < "$OUTPUT"
+          exit 1
+        fi
+
+        # ---- Semgrep SAST ----
+        OUTPUT=$(mktemp)
+        semgrep scan --config=p/default --config=p/rego --config=p/yaml --config=p/terraform --error | tee "$OUTPUT"
+        if [ ${PIPESTATUS[0]} -ne 0 ]; then
+          buildkite-agent annotate --style "error" --context "Semgrep" --append < "$OUTPUT"
+          exit 1
+        fi
+
+        # ---- OPA Regal lint ----
+        OUTPUT=$(mktemp)
+        regal lint rego | tee "$OUTPUT"
+        if [ ${PIPESTATUS[0]} -ne 0 ]; then
+          buildkite-agent annotate --style "error" --context "OPA Regal Lint" --append < "$OUTPUT"
+          exit 1
+        fi
+
+        # ---- OPA unit tests + validation ----
+        OUTPUT=$(mktemp)
+        opa test rego tests | tee "$OUTPUT"
+        if [ ${PIPESTATUS[0]} -ne 0 ]; then
+          buildkite-agent annotate --style "error" --context "OPA Tests" --append < "$OUTPUT"
+          exit 1
+        fi
+        kubectl kustomize "policies/overlays/prd" > policies.yaml
+        opa eval --fail-defined -d rego -i policies.yaml "data.tetragon.governance" | tee -a "$OUTPUT"
+        if [ ${PIPESTATUS[0]} -ne 0 ]; then
+          buildkite-agent annotate --style "error" --context "OPA Validation" --append < "$OUTPUT"
+          exit 1
+        fi
+
+        echo "✅ PR preview checks complete (merge blocked if failed)"
+
+  # =========================
+  # 3️⃣ Main Branch Release Flow
+  # =========================
+  - label: "🔐 Security | Secrets Scan (GitGuardian)"
+    branches: "main"
+    depends_on: install-tools
+    commands:
+      - |
+        set -e
+        OUTPUT=$(mktemp)
+        if ! ggshield secret scan repo . --all --exit-zero=false | tee "$OUTPUT"; then
+          buildkite-agent annotate --style "error" --context "GitGuardian" --append < "$OUTPUT"
+          exit 1
+        fi
+
+  - label: "🧠 Security | SAST (Semgrep)"
+    branches: "main"
+    depends_on: install-tools
+    commands:
+      - |
+        set -e
+        OUTPUT=$(mktemp)
+        if ! semgrep scan --config=p/default --config=p/rego --config=p/yaml --config=p/terraform --error | tee "$OUTPUT"; then
+          buildkite-agent annotate --style "error" --context "Semgrep" --append < "$OUTPUT"
+          exit 1
+        fi
+
+  - label: "🧪 OPA | Unit Tests + Policy Validation"
+    branches: "main"
+    depends_on: install-tools
+    commands:
+      - |
+        set -e
+        OUTPUT=$(mktemp)
+        if ! opa test rego tests | tee "$OUTPUT"; then
+          buildkite-agent annotate --style "error" --context "OPA Tests" --append < "$OUTPUT"
+          exit 1
+        fi
+        kubectl kustomize "policies/overlays/prd" > policies.yaml
+        if ! opa eval --fail-defined -d rego -i policies.yaml "data.tetragon.governance" | tee -a "$OUTPUT"; then
+          buildkite-agent annotate --style "error" --context "OPA Validation" --append < "$OUTPUT"
+          exit 1
+        fi
+
+  - label: "🧾 Release | git-cliff Version & Changelog"
+    branches: "main"
+    depends_on:
+      - "🔐 Security | Secrets Scan (GitGuardian)"
+      - "🧠 Security | SAST (Semgrep)"
+      - "🧹 OPA | Lint Rego (Regal)"
+      - "🧪 OPA | Unit Tests + Policy Validation"
+    commands:
+      - git-cliff --output CHANGELOG.md --tag-pattern "v[0-9]*"
+      - VERSION=$(git-cliff --bumped-version)
+      - echo "$VERSION" > VERSION
+    artifacts:
+      - CHANGELOG.md
+      - VERSION
+
+  - label: "📦 OPA | Build Versioned Bundle"
+    branches: "main"
+    depends_on: "🧾 Release | git-cliff Version & Changelog"
+    commands:
+      - |
+        VERSION=$(cat VERSION)
+        mkdir -p build
+        opa build --bundle rego --output build/tetragon-opa-bundle-${VERSION}.tar.gz
+    artifacts:
+      - build/tetragon-opa-bundle-*.tar.gz
+
+  - label: "🔏 OPA | Sign Bundle"
+    branches: "main"
+    depends_on: "📦 OPA | Build Versioned Bundle"
+    commands:
+      - |
+        VERSION=$(cat VERSION)
+        BUNDLE_FILE="build/tetragon-opa-bundle-${VERSION}.tar.gz"
+        cosign sign-blob --key "${COSIGN_PRIVATE_KEY}" --output-signature "${BUNDLE_FILE}.sig" "${BUNDLE_FILE}"
+        echo "✅ Bundle signed: ${BUNDLE_FILE}.sig"
+
+  - label: "🚢 OPA | Push Bundle to Harbor"
+    branches: "main"
+    depends_on: "🔏 OPA | Sign Bundle"
+    commands:
+      - |
+        set -e
+        VERSION=$(cat VERSION)
+        BUNDLE_FILE="build/tetragon-opa-bundle-${VERSION}.tar.gz"
+        SIG_FILE="${BUNDLE_FILE}.sig"
+        IMAGE_REF="harbor.example.com/opa/tetragon-opa-bundle:${VERSION}"
+
+        echo "Logging into Harbor"
+        echo "${HARBOR_PASSWORD}" | oras login "harbor.example.com" -u "${HARBOR_USERNAME}" --password-stdin
+
+        echo "Pushing OPA bundle as OCI artifact"
+        oras push "${IMAGE_REF}" \
+          --artifact-type application/vnd.cncf.opa.policy.config.tar+gzip \
+          "${BUNDLE_FILE}"
+
+        echo "Pushing bundle signature as separate OCI artifact"
+        oras push "${IMAGE_REF}-sig" \
+          --artifact-type application/vnd.cncf.opa.policy.config.signature \
+          "${SIG_FILE}"
+
+        echo "✅ OPA bundle + signature pushed: ${IMAGE_REF}"
